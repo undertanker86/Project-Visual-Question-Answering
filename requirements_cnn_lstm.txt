@@ -1,0 +1,7 @@
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+torchtext==0.16.0  # Compatible with torch 2.1.0
+timm==0.9.2        # Stable version, compatible with newer torch versions
+transformers==4.27.1
+numpy==1.23.5 

@@ -1,21 +1,16 @@
 import torch
 import torch.nn as nn
-import torchtext
 import os
 import random
 import numpy as np
 import pandas as pd
-import spacy
-import timm
 import matplotlib.pyplot as plt
 
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator
 from torchvision import transforms
-
+from transformers import ViTModel, ViTImageProcessor
+from transformers import AutoTokenizer, RobertaModel
 
 def set_seed(seed):
     random.seed(seed)
@@ -26,42 +21,24 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-
-
-# Load the English tokenizer from spaCy
-eng = spacy.load("en_core_web_sm")
-
-def get_tokens(data_iter):
-    for sample in data_iter:
-        question = sample['question']
-        yield [token.text for token in eng.tokenizer(question)]
-
-
-def tokenize(question, max_seq_len):
-    tokens = [token.text for token in eng.tokenizer(question)]
-    sequence = [vocab[token] for token in tokens]
-    if len(sequence) < max_seq_len:
-        sequence += [vocab['<pad>']] * (max_seq_len - len(sequence))
-    else:
-        sequence = sequence[:max_seq_len]
-
-    return sequence
-
 class VQADataset(Dataset):
     def __init__(
         self,
         data,
         label2idx,
-        max_seq_len=20,
-        transform=None,
-        img_dir='/home/always/VQA/Project-Visual-Question-Answering/data/vqa_coco_dataset/val2014-resised/'
+        img_feature_extractor,
+        text_tokenizer,
+        device,
+        transforms=None,
+        img_dir='val2014-resised'
     ):
-        self.transform = transform
         self.data = data
-        self.max_seq_len = max_seq_len
         self.img_dir = img_dir
         self.label2idx = label2idx
+        self.img_feature_extractor = img_feature_extractor
+        self.text_tokenizer = text_tokenizer
+        self.device = device
+        self.transforms = transforms
 
     def __len__(self):
         return len(self.data)
@@ -69,89 +46,118 @@ class VQADataset(Dataset):
     def __getitem__(self, index):
         img_path = os.path.join(self.img_dir, self.data[index]['image_path'])
         img = Image.open(img_path).convert('RGB')
-        if self.transform:
-            img = self.transform(img)
+
+        if self.transforms:
+            img = self.transforms(img)
+
+        if self.img_feature_extractor:
+            img = self.img_feature_extractor(images=img, return_tensors="pt")
+            img = {k: v.to(self.device).squeeze(0) for k, v in img.items()}
 
         question = self.data[index]['question']
-        question = tokenize(question, self.max_seq_len)
-        question = torch.tensor(question, dtype=torch.long)
+        if self.text_tokenizer:
+            question = self.text_tokenizer(
+                question,
+                padding="max_length",
+                max_length=20,
+                truncation=True,
+                return_tensors="pt"
+            )
+            question = {k: v.to(self.device).squeeze(0) for k, v in question.items()}
 
         label = self.data[index]['answer']
-        label = self.label2idx[label]
-        label = torch.tensor(label, dtype=torch.long)
+        label = torch.tensor(
+            self.label2idx[label],
+            dtype=torch.long
+        ).to(self.device)
 
-        return img, question, label
-class VQAModel(nn.Module):
+        sample = {
+            'image': img,
+            'question': question,
+            'label': label
+        }
+
+        return sample
+class TextEncoder(nn.Module):
+    def __init__(self):
+        super(TextEncoder, self).__init__()
+        self.model = RobertaModel.from_pretrained("roberta-base")
+
+    def forward(self, inputs):
+        outputs = self.model(**inputs)
+        return outputs.pooler_output
+class VisualEncoder(nn.Module):
+    def __init__(self):
+        super(VisualEncoder, self).__init__()
+        self.model = ViTModel.from_pretrained("google/vit-base-patch16-224")
+
+    def forward(self, inputs):
+        outputs = self.model(**inputs)
+        return outputs.pooler_output
+class Classifier(nn.Module):
     def __init__(
         self,
-        n_classes,
-        img_model_name,
-        embeddding_dim,
-        n_layers=2,
-        hidden_size=256,
-        drop_p=0.2
+        hidden_size=512,
+        dropout_prob=0.2,
+        n_classes=2
     ):
-        super(VQAModel, self).__init__()
-        
-        # Image encoder
-        self.image_encoder = timm.create_model(
-            img_model_name,
-            pretrained=True,
-            num_classes=hidden_size
-        )
-
-        # Fine-tune image encoder
-        for param in self.image_encoder.parameters():
-            param.requires_grad = True
-
-        # Text embedding and LSTM layers
-        self.embedding = nn.Embedding(len(vocab), embeddding_dim)
-        self.lstm1 = nn.LSTM(
-            input_size=embeddding_dim,
-            hidden_size=hidden_size,
-            num_layers=n_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=drop_p
-        )
-
-        # Fully connected layers
-        self.fc1 = nn.Linear(hidden_size * 3, hidden_size)
-        self.dropout = nn.Dropout(drop_p)
+        super(Classifier, self).__init__()
+        self.fc1 = nn.Linear(768 * 2, hidden_size)
+        self.dropout = nn.Dropout(dropout_prob)
         self.gelu = nn.GELU()
         self.fc2 = nn.Linear(hidden_size, n_classes)
 
-    def forward(self, img, text):
-        # Encode image features
-        img_features = self.image_encoder(img)
-
-        # Encode text features
-        text_emb = self.embedding(text)
-        lstm_out, _ = self.lstm1(text_emb)
-
-        # Use the last hidden state from LSTM
-        lstm_out = lstm_out[:, -1, :]
-
-        # Combine image and text features
-        combined = torch.cat((img_features, lstm_out), dim=1)
-
-        # Fully connected layers
-        x = self.fc1(combined)
+    def forward(self, x):
+        x = self.fc1(x)
         x = self.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        return x
+class VQAModel(nn.Module):
+    def __init__(
+        self,
+        visual_encoder,
+        text_encoder,
+        classifier
+    ):
+        super(VQAModel, self).__init__()
+        self.visual_encoder = visual_encoder
+        self.text_encoder = text_encoder
+        self.classifier = classifier
+
+    def forward(self, image, answer):
+        text_out = self.text_encoder(answer)
+        image_out = self.visual_encoder(image)
+
+        x = torch.cat((image_out, text_out), dim=1)
+        x = self.classifier(x)
 
         return x
-def evaluate(model, dataloader, criterion, device):
+
+    def freeze(self, visual=True, textual=True, clas=False):
+        if visual:
+            for n, p in self.visual_encoder.named_parameters():
+                p.requires_grad = False
+        if textual:
+            for n, p in self.text_encoder.named_parameters():
+                p.requires_grad = False
+        if clas:
+            for n, p in self.classifier.named_parameters():
+                p.requires_grad = False
+
+def evaluate(model, dataloader, criterion):
     model.eval()
     correct = 0
     total = 0
     losses = []
-
+    
     with torch.no_grad():
-        for image, question, labels in dataloader:
-            image, question, labels = image.to(device), question.to(device), labels.to(device)
-            outputs = model(image, question)
+        for idx, inputs in enumerate(dataloader):
+            images = inputs['image']
+            questions = inputs['question']
+            labels = inputs['label']
+
+            outputs = model(images, questions)
             loss = criterion(outputs, labels)
             losses.append(loss.item())
 
@@ -171,7 +177,6 @@ def fit(
     criterion,
     optimizer,
     scheduler,
-    device,
     epochs
 ):
     train_losses = []
@@ -181,8 +186,10 @@ def fit(
         batch_train_losses = []
 
         model.train()
-        for idx, (images, questions, labels) in enumerate(train_loader):
-            images, questions, labels = images.to(device), questions.to(device), labels.to(device)
+        for idx, inputs in enumerate(train_loader):
+            images = inputs['image']
+            questions = inputs['question']
+            labels = inputs['label']
 
             optimizer.zero_grad()
             outputs = model(images, questions)
@@ -196,15 +203,17 @@ def fit(
         train_losses.append(train_loss)
 
         val_loss, val_acc = evaluate(
-            model, val_loader, criterion, device
+            model, val_loader,
+            criterion
         )
         val_losses.append(val_loss)
 
-        print(f'EPOCH {epoch + 1}: Train loss: {train_loss:.4f} Val loss: {val_loss:.4f} Val Acc: {val_acc:.4f}')
+        print(f'EPOCH {epoch + 1}:\tTrain loss: {train_loss:.4f}\tVal loss: {val_loss:.4f}\tVal Acc: {val_acc:.4f}')
 
         scheduler.step()
 
     return train_losses, val_losses
+               
 if __name__ == '__main__':
 
     seed = 59
@@ -212,6 +221,11 @@ if __name__ == '__main__':
     # Load train data
     train_data = []
     train_set_path = '/home/always/VQA/Project-Visual-Question-Answering/data/vqa_coco_dataset/vaq2.0.TrainImages.txt'
+
+
+        # Load train data
+    train_data = []
+    train_set_path = './vaq2.0.TrainImages.txt'
 
     with open(train_set_path, "r") as f:
         lines = f.readlines()
@@ -233,7 +247,7 @@ if __name__ == '__main__':
 
     # Load val data
     val_data = []
-    val_set_path = '/home/always/VQA/Project-Visual-Question-Answering/data/vqa_coco_dataset/vaq2.0.DevImages.txt'
+    val_set_path = './vaq2.0.DevImages.txt'
 
     with open(val_set_path, "r") as f:
         lines = f.readlines()
@@ -255,7 +269,7 @@ if __name__ == '__main__':
 
     # Load test data
     test_data = []
-    test_set_path = '/home/always/VQA/Project-Visual-Question-Answering/data/vqa_coco_dataset/vaq2.0.TestImages.txt'
+    test_set_path = './vaq2.0.TestImages.txt'
 
     with open(test_set_path, "r") as f:
         lines = f.readlines()
@@ -275,59 +289,50 @@ if __name__ == '__main__':
             }
             test_data.append(data_sample)
 
-
-    # Build the vocabulary from the training data tokens
-    vocab = build_vocab_from_iterator(
-        get_tokens(train_data),
-        min_freq=2,
-        specials=['<pad>', '<sos>', '<eos>', '<unk>'],
-        special_first=True
-    )
-
-    # Set the default index for unknown tokens
-    vocab.set_default_index(vocab['<unk>'])
-
-
-    # Create label mapping
     classes = set([sample['answer'] for sample in train_data])
-    label2idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-    idx2label = {idx: cls_name for idx, cls_name in enumerate(classes)}
+    label2idx = {
+        cls_name: idx for idx, cls_name in enumerate(classes)
+    }
+    idx2label = {
+        idx: cls_name for idx, cls_name in enumerate(classes)
+    }
 
+    data_transform = transforms.Compose([
+    transforms.Resize(size=(224, 224)),
+    transforms.CenterCrop(size=180),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+    transforms.RandomHorizontalFlip(),
+    transforms.GaussianBlur(3),
+])
+    img_feature_extractor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+    text_tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-
-    data_transform = {
-    'train': transforms.Compose([
-        transforms.Resize(size=(224, 224)),
-        transforms.CenterCrop(size=180),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-        transforms.RandomHorizontalFlip(),
-        transforms.GaussianBlur(3),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ]),
-    'val': transforms.Compose([
-        transforms.Resize(size=(224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-}
     train_dataset = VQADataset(
-    train_data,
-    label2idx=label2idx,
-    transform=data_transform['train']
-)
+        train_data,
+        label2idx=label2idx,
+        img_feature_extractor=img_feature_extractor,
+        text_tokenizer=text_tokenizer,
+        device=device,
+        transforms=data_transform
+    )
 
     val_dataset = VQADataset(
         val_data,
         label2idx=label2idx,
-        transform=data_transform['val']
+        img_feature_extractor=img_feature_extractor,
+        text_tokenizer=text_tokenizer,
+        device=device
     )
 
     test_dataset = VQADataset(
         test_data,
         label2idx=label2idx,
-        transform=data_transform['val']
+        img_feature_extractor=img_feature_extractor,
+        text_tokenizer=text_tokenizer,
+        device=device
     )
+
     train_batch_size = 256
     test_batch_size = 32
 
@@ -350,25 +355,28 @@ if __name__ == '__main__':
     )
 
     n_classes = len(classes)
-    img_model_name = 'resnet18'
     hidden_size = 256
-    n_layers = 2
-    embeddding_dim = 128
-    drop_p = 0.2
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dropout_prob = 0.2
 
-    model = VQAModel(
-        n_classes=n_classes,
-        img_model_name=img_model_name,
-        embeddding_dim=embeddding_dim,
-        n_layers=n_layers,
+    text_encoder = TextEncoder().to(device)
+    visual_encoder = VisualEncoder().to(device)
+    classifier = Classifier(
         hidden_size=hidden_size,
-        drop_p=drop_p
+        dropout_prob=dropout_prob,
+        n_classes=n_classes
     ).to(device)
 
-    lr = 1e-3
-    epochs = 50
+    model = VQAModel(
+        visual_encoder=visual_encoder,
+        text_encoder=text_encoder,
+        classifier=classifier
+    ).to(device)
 
+    model.freeze()
+
+    lr = 1e-3
+
+    epochs = 50
     scheduler_step_size = int(epochs * 0.8)
     criterion = nn.CrossEntropyLoss()
 
@@ -390,24 +398,25 @@ if __name__ == '__main__':
     criterion,
     optimizer,
     scheduler,
-    device,
     epochs
 )
-    
+
     val_loss, val_acc = evaluate(
-    model,
-    val_loader,
-    criterion,
-    device
-)
+        model,
+        val_loader,
+        criterion
+    )
 
     test_loss, test_acc = evaluate(
         model,
         test_loader,
-        criterion,
-        device
+        criterion
     )
 
     print('Evaluation on val/test dataset')
     print('Val accuracy:', val_acc)
     print('Test accuracy:', test_acc)
+
+
+
+
