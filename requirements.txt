@@ -1,0 +1,6 @@
+timm==0.8.17.dev0
+torchtext==0.15.1
+torchvision==0.16.0
+torchaudio==2.1.0
+torch==2.1.0
+transformers==4.27.1
